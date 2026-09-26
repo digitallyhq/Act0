@@ -1,0 +1,219 @@
+# Bismillah Ar-Rahman Ar-Raheem. Ash-hadu an laa ilaaha illa-Llah, wa ash-hadu
+# anna Muhammadan Abduhu wa Rasooluh. Laa hawla wa laa quwwata illaa biLLAH.
+# Hasbiyallaahu laa ilaaha illaa Huwa, 'alayhi tawakkaltu wa Huwa
+# Rabbul-'Arshil-'Azeem. SubhaanALLAH wa bihamdih, SubhaanALLAHil-'azeem.
+#
+# ============================================================================
+# Keep-Alive Pinger B (sibling of ridwanullahh/Act0 — alternating coverage)
+# ----------------------------------------------------------------------------
+# Purpose : NEVER let a moment pass without pinging. The sibling repo
+#           (ridwanullahh/Act0) runs a self-rescheduling chain that pings the
+#           targets every ~5.5 minutes. This workflow runs the SAME chain in a
+#           second, independent repository and PHASE-ALIGNS each of its runs
+#           to the MIDPOINT of the sibling's current cycle:
+#
+#             sibling ping ──(165s)── THIS ping ──(165s)── sibling ping ── ...
+#
+#           Net effect: a ping round roughly every ~2.75 minutes around the
+#           clock. If the sibling chain ever dies, this repo detects it (no
+#           recent sibling run) and reverts to its own full-speed 5.5-minute
+#           chain — coverage never drops to zero. If GitHub's scheduler drops
+#           a dispatched handoff, the offset backstop crons re-seed it. Two
+#           independent chains in two repos cannot share a failure mode.
+#
+# Phase alignment (best effort, never skips a ping):
+#   - Query the sibling repo's most recent "Keep-Alive Pinger" run via the
+#     GitHub API (public repo; GITHUB_TOKEN works cross-repo for public data).
+#   - phase = seconds since the sibling's latest run started.
+#   - If phase < half-cycle, sleep the remainder to land at the midpoint;
+#     otherwise ping immediately (we are already in the useful window).
+#   - Any API error or a sibling idle > 10 minutes  →  ping immediately.
+#   - The sleep is hard-capped at 165s and can never postpone a ping past the
+#     next sibling cycle.
+#
+# Security posture (identical to the sibling):
+#   - No personal access token is stored anywhere: the run uses the built-in
+#     GITHUB_TOKEN, scoped to permissions.actions=write only.
+#   - No third-party Actions and no checkout: only curl + the preinstalled gh.
+#   - All external inputs (URLs) enter as environment variables, never as
+#     shell-interpolated GitHub Expressions — script injection is ruled out.
+#   - URLs are validated to be absolute http(s) URLs; curl is invoked with
+#     '--' so an argument can never be parsed as a flag; query strings are
+#     never logged (they may embed tokens).
+#
+# Customization (no code edit needed):
+#   - URLs     : repo VARIABLE vars.PING_URLS (comma/space/newline separated)
+#                or repo SECRET secrets.PING_URLS if URLs must stay hidden.
+#   - Interval : repo VARIABLE vars.PING_INTERVAL_SECONDS (default 330 s).
+#   - Sibling  : repo VARIABLE vars.SIBLING_REPO (default ridwanullahh/Act0).
+# ============================================================================
+
+name: Keep-Alive Pinger
+
+on:
+  schedule:
+    # Backstop backbone — re-seeds the chain if a handoff ever fails.
+    # Offset from the sibling's backstops (*/5 and 2-59/5) so both repos do
+    # not stampede the scheduler on the same minutes.
+    - cron: '1-56/5 * * * *'
+    # Offset backstop (avoids the top-of-hour scheduler stampede).
+    - cron: '3-58/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      override_urls:
+        description: 'Optional: URLs to ping for THIS run only (comma/space separated). Leave empty to use the configured URLs.'
+        required: false
+        default: ''
+
+permissions:
+  actions: write          # needed only to dispatch the next chain run
+  contents: none
+
+concurrency:
+  group: keep-alive-pinger
+  cancel-in-progress: false   # successors queue instead of cancelling the
+                              # parent (runs stay green); the dedup guard plus
+                              # quick guard-exits drain the queue harmlessly
+
+jobs:
+  ping:
+    name: Phase-aligned ping + reschedule chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Align phase with the sibling pinger (never skips a ping)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIBLING_REPO: ${{ vars.SIBLING_REPO }}
+          INTERVAL_VAR: ${{ vars.PING_INTERVAL_SECONDS }}
+        run: |
+          set -u
+          SIBLING="${SIBLING_REPO:-ridwanullahh/Act0}"
+          INTERVAL="${INTERVAL_VAR:-330}"
+          case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=330 ;; esac
+          [ "$INTERVAL" -lt 60 ]  && INTERVAL=60
+          [ "$INTERVAL" -gt 540 ] && INTERVAL=540
+          HALF=$((INTERVAL / 2))
+
+          align="$(mktemp)"
+          # Best effort: find the sibling's most recent run of "Keep-Alive Pinger".
+          code="$(gh api "repos/$SIBLING/actions/runs?per_page=20" -q '.workflow_runs[] | select(.name=="Keep-Alive Pinger") | .run_started_at' 2>/dev/null | head -n1 > "$align" && echo 0 || echo 1)"
+          latest="$(tr -d '\n' < "$align")"; rm -f "$align"
+
+          if [ "$code" -ne 0 ] || [ -z "$latest" ]; then
+            echo "Phase alignment: sibling run list unavailable — pinging immediately (coverage first)."
+            exit 0
+          fi
+
+          now="$(date -u +%s)"
+          started="$(date -u +%s -d "$latest" 2>/dev/null || echo '')"
+          if [ -z "$started" ]; then
+            echo "Phase alignment: could not parse sibling timestamp — pinging immediately."
+            exit 0
+          fi
+
+          phase=$(( now - started ))
+          if [ "$phase" -lt 0 ]; then phase=0; fi
+          if [ "$phase" -gt $(( INTERVAL * 2 )) ]; then
+            echo "Sibling idle for ${phase}s (> 2 cycles) — sibling chain appears dead: taking over immediately."
+            exit 0
+          fi
+          wait_s=$(( HALF - phase ))
+          if [ "$wait_s" -le 5 ]; then
+            echo "Phase ${phase}s (past midpoint) — pinging immediately."
+            exit 0
+          fi
+          [ "$wait_s" -gt "$HALF" ] && wait_s="$HALF"
+          echo "Sibling cycle phase ${phase}s — sleeping ${wait_s}s to land at the midpoint of the sibling's cycle."
+          sleep "$wait_s"
+
+      - name: Ping configured URLs (curl only)
+        env:
+          PING_URLS_OVERRIDE: ${{ github.event.inputs.override_urls }}
+          PING_URLS_VAR: ${{ vars.PING_URLS }}       # repo VARIABLE (Settings → Secrets and variables → Actions → Variables)
+          PING_URLS_SECRET: ${{ secrets.PING_URLS }} # repo SECRET (use if URLs must stay hidden)
+          PING_URLS_DEFAULT: 'https://9001-01m2paqfkv4npk7qny04t0e7q7.cloudspaces.litng.ai/'
+        run: |
+          set -u
+
+          # ---- Resolve URL list: override → variable → secret → default ----
+          URLS="${PING_URLS_OVERRIDE:-}"
+          if [ -z "$URLS" ]; then URLS="${PING_URLS_VAR:-}"; fi
+          if [ -z "$URLS" ]; then URLS="${PING_URLS_SECRET:-}"; fi
+          if [ -z "$URLS" ]; then URLS="${PING_URLS_DEFAULT:-}"; fi
+          # Support comma-separated AND whitespace-separated lists.
+          URLS="$(printf '%s' "$URLS" | tr ',\r' '  ')"
+
+          ok=0; bad=0; total=0
+          summary="$(mktemp)"
+          {
+            echo "### Keep-Alive Pinger (B) — $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo
+            echo "| Target (origin only — query strings are not logged) | HTTP status |"
+            echo "| --- | --- |"
+          } > "$summary"
+
+          for url in $URLS; do
+            # ---- Validation (security): must be an absolute http(s) URL ----
+            case "$url" in
+              https://*|http://*) : ;;
+              *) echo "::warning::Skipping invalid URL entry: $url"; continue ;;
+            esac
+            total=$((total+1))
+            # '--' ensures the URL can never be parsed as a curl flag. Even a
+            # timeout still delivered traffic (which is what wakes the host).
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 45 --retry 1 --retry-delay 1 -- "$url" 2>/dev/null || echo 000)"
+            display="${url%%\?*}"   # never echo query strings (may embed tokens)
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $display -> HTTP $code"
+            echo "| $display | $code |" >> "$summary"
+            case "$code" in
+              2*|3*) ok=$((ok+1)) ;;
+              *) bad=$((bad+1)); echo "::warning::$display answered HTTP $code (the request still wakes the target)" ;;
+            esac
+          done
+
+          {
+            cat "$summary"
+            echo
+            echo "Targets: $total · OK: $ok · Not-OK: $bad"
+          } > "$GITHUB_STEP_SUMMARY"
+          rm -f "$summary"
+          if [ "$total" -eq 0 ]; then
+            echo "::error::No valid URLs configured. Set repo VARIABLE vars.PING_URLS (or SECRET secrets.PING_URLS), pass override_urls on manual dispatch, or edit PING_URLS_DEFAULT."
+          fi
+          echo "Ping round complete — $ok/$total responded OK."
+
+      - name: Reschedule the next chain run (always-on, not just once)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SELF_RUN_ID: ${{ github.run_id }}
+          WF_REF: ${{ github.ref_name }}
+          SLEEP_SECONDS_VAR: ${{ vars.PING_INTERVAL_SECONDS }}
+        run: |
+          set -euo pipefail
+          SLEEP_SECONDS="${SLEEP_SECONDS_VAR:-330}"
+          case "$SLEEP_SECONDS" in ''|*[!0-9]*) SLEEP_SECONDS=330 ;; esac
+          [ "$SLEEP_SECONDS" -lt 60 ]  && SLEEP_SECONDS=60    # never hammer the target
+          [ "$SLEEP_SECONDS" -gt 540 ] && SLEEP_SECONDS=540   # stay under 10 minutes
+          echo "Chain heartbeat: sleeping ${SLEEP_SECONDS}s before dispatching the next run..."
+          sleep "$SLEEP_SECONDS"
+
+          # Guard: hand off only if no OTHER run of THIS workflow is active or
+          # queued (a backstop cron about to fire will carry the chain instead).
+          # The result is sanitized: an API hiccup must never break the chain.
+          busy="$(gh api "repos/$REPO/actions/runs?per_page=60" \
+            --jq "[.workflow_runs[] | select(.name==\"Keep-Alive Pinger\" and .id != $SELF_RUN_ID and (.status==\"queued\" or .status==\"in_progress\"))] | length" 2>/dev/null | tail -n1 || true)"
+          case "$busy" in ''|*[!0-9]*) busy=0 ;; esac
+          if [ "$busy" -gt 0 ]; then
+            echo "Another pinger run is active/queued ($busy) — it carries the chain; no extra dispatch."
+            exit 0
+          fi
+
+          # -R is mandatory: this job has no checkout, so gh cannot infer the
+          # repository from a local .git directory.
+          gh workflow run keep-alive.yml --ref "$WF_REF" -R "$REPO"
+          echo "Next chain run dispatched — the pinger keeps running continuously."
+
+# SubhanaLLAH, WalhamduliLLAH, Walaailaaha-illa-ALLAH, WaLLAHU-AKBAR,
+# Walahawla-walakuwata-illabiLLAH. Astaghfirullaaha wa atoobu ilayh.
